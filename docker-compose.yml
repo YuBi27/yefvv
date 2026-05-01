@@ -30,7 +30,7 @@ services:
     environment:
       BOT_TOKEN: ${BOT_TOKEN}
       ADMIN_IDS: ${ADMIN_IDS}
-      TEACHER_LINK: ${TEACHER_LINK:-https://t.me/yevhenia_frolova}
+      TEACHER_LINK: ${TEACHER_LINK:-https://t.me/yev_fr}
       REDIS_URL: redis://redis:6379
       DATABASE_URL: postgresql+asyncpg://bot:bot@postgres:5432/botdb
       QUESTIONS_FILE: /app/questions.json
@@ -73,12 +73,12 @@ services:
 
   adminer:
     image: adminer:latest
-    ports:
-      - "8888:8080"
+    expose:
+      - "8080"
     depends_on:
       - postgres
     restart: unless-stopped
-
+    
 volumes:
   postgres_data:
   redis_data:

@@ -59,9 +59,9 @@ class UserState(StatesGroup):
     quiz_in_progress = State()
     post_test_score = State()
     broadcast_waiting = State()
-    # Admin question editor
-    edit_search = State()        # searching question by number
-    edit_field = State()         # waiting for new value
+    edit_search = State()
+    edit_field = State()
+    admin_user_mode = State()   # admin browsing as regular user
 
 
 # ---------------------------------------------------------------------------
@@ -208,6 +208,7 @@ def admin_menu_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="📋 Заявки на розгляді", callback_data="admin:pending")],
             [InlineKeyboardButton(text="✏️ Редагувати питання", callback_data="admin:edit_questions")],
             [InlineKeyboardButton(text="📣 Розсилка", callback_data="admin:broadcast")],
+            [InlineKeyboardButton(text="👤 Режим користувача", callback_data="admin:user_mode")],
         ]
     )
 
@@ -218,10 +219,18 @@ def admin_reply_keyboard() -> ReplyKeyboardMarkup:
         keyboard=[
             [KeyboardButton(text="👥 Користувачі"), KeyboardButton(text="📋 Заявки")],
             [KeyboardButton(text="✏️ Питання"), KeyboardButton(text="📣 Розсилка")],
-            [KeyboardButton(text="🏠 Меню")],
+            [KeyboardButton(text="👤 Режим користувача"), KeyboardButton(text="🏠 Меню")],
         ],
         resize_keyboard=True,
         is_persistent=True,
+    )
+
+
+def back_to_admin_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="👑 Повернутися в панель адміна", callback_data="admin:back_to_admin")],
+        ]
     )
 
 
@@ -360,11 +369,26 @@ async def send_question(bot: Bot, chat_id: int, state: FSMContext, session: Asyn
         user_id: int = data["user_id"]
         username: str = data.get("username", "")
         section_label = data.get("section", "")
+        is_admin: bool = data.get("is_admin", False)
 
         result_obj = UserResult(user_id=user_id, username=username, score=score, total=total)
         session.add(result_obj)
         await session.commit()
         await state.clear()
+
+        # If admin in user mode — show result + back button, skip funnel
+        if is_admin:
+            await safe_send(
+                bot.send_message,
+                chat_id,
+                f"🏁 <b>Тест завершено!</b>"
+                + (f" [{section_label}]" if section_label else "")
+                + f"\n\nРезультат: <b>{score}/{total}</b> ({pct}%)\n\n"
+                "👑 Ти проходив тест у режимі користувача.",
+                parse_mode="HTML",
+                reply_markup=back_to_admin_keyboard(),
+            )
+            return
 
         # Notify user — post-test funnel message #1
         await safe_send(
@@ -505,8 +529,21 @@ async def main():
     # -----------------------------------------------------------------------
     @dp.message(Command("start"))
     async def cmd_start(message: Message, state: FSMContext):
-        # Admin shortcut
+        # Admin shortcut — but check if in user mode first
         if message.from_user.id in ADMIN_IDS:
+            current_state = await state.get_state()
+            if current_state == UserState.admin_user_mode:
+                # Already in user mode — show quiz menu with back button
+                await message.answer(
+                    "👤 Ти в режимі користувача. Обери формат тесту:",
+                    reply_markup=quiz_menu_keyboard(),
+                )
+                await message.answer(
+                    "↩️ Або повернись в панель адміна:",
+                    reply_markup=back_to_admin_keyboard(),
+                )
+                return
+            # Normal admin start
             await safe_send(
                 message.answer,
                 "👑 Панель адміна — обери дію:",
@@ -801,10 +838,66 @@ async def main():
         )
 
     @dp.message(F.text == "🏠 Меню")
-    async def admin_home(message: Message):
+    async def admin_home(message: Message, state: FSMContext):
         if message.from_user.id not in ADMIN_IDS:
             return
-        await message.answer("Обери дію:", reply_markup=admin_menu_keyboard())
+        # Exit user mode if active
+        await state.clear()
+        await safe_send(
+            message.answer,
+            "👑 Панель адміна — обери дію:",
+            reply_markup=admin_reply_keyboard(),
+        )
+
+    @dp.message(F.text == "👤 Режим користувача")
+    async def admin_user_mode_btn(message: Message, state: FSMContext):
+        if message.from_user.id not in ADMIN_IDS:
+            return
+        await state.set_state(UserState.admin_user_mode)
+        await message.answer(
+            "👤 <b>Режим користувача активовано</b>\n\n"
+            "Тепер ти бачиш бот очима користувача.\n"
+            "Обери формат тесту 👇",
+            parse_mode="HTML",
+            reply_markup=quiz_menu_keyboard(),
+        )
+        await message.answer(
+            "↩️ Повернутися в панель адміна:",
+            reply_markup=back_to_admin_keyboard(),
+        )
+
+    @dp.callback_query(F.data == "admin:user_mode")
+    async def admin_user_mode_cb(callback: CallbackQuery, state: FSMContext):
+        if callback.from_user.id not in ADMIN_IDS:
+            await callback.answer("⛔", show_alert=True)
+            return
+        await callback.answer()
+        await state.set_state(UserState.admin_user_mode)
+        await callback.message.answer(
+            "👤 <b>Режим користувача активовано</b>\n\n"
+            "Тепер ти бачиш бот очима користувача.\n"
+            "Обери формат тесту 👇",
+            parse_mode="HTML",
+            reply_markup=quiz_menu_keyboard(),
+        )
+        await callback.message.answer(
+            "↩️ Повернутися в панель адміна:",
+            reply_markup=back_to_admin_keyboard(),
+        )
+
+    @dp.callback_query(F.data == "admin:back_to_admin")
+    async def back_to_admin_cb(callback: CallbackQuery, state: FSMContext):
+        if callback.from_user.id not in ADMIN_IDS:
+            await callback.answer("⛔", show_alert=True)
+            return
+        await callback.answer()
+        await state.clear()
+        await callback.message.edit_reply_markup(reply_markup=None)
+        await safe_send(
+            callback.message.answer,
+            "👑 Панель адміна — обери дію:",
+            reply_markup=admin_reply_keyboard(),
+        )
 
     @dp.message(F.text == "👥 Користувачі")
     async def admin_users_btn(message: Message):
@@ -1233,17 +1326,18 @@ async def main():
     # -----------------------------------------------------------------------
     async def start_quiz(message: Message, state: FSMContext, count: int | None = None, user=None, section: str | None = None):
         actual_user = user or message.from_user
+        is_admin = actual_user.id in ADMIN_IDS
 
         async with session_factory() as session:
             req = (await session.execute(
                 select(AccessRequest).where(AccessRequest.user_id == actual_user.id)
             )).scalar()
-        has_access = (req and req.approved) or actual_user.id in ADMIN_IDS
+        has_access = (req and req.approved) or is_admin
         if not has_access:
             await message.answer("🔒 Спочатку потрібно отримати доступ. Напиши /start і надішли скріншоти.")
             return
 
-        if req and not req.pib and actual_user.id not in ADMIN_IDS:
+        if req and not req.pib and not is_admin:
             await state.set_state(UserState.filling_pib)
             await message.answer(
                 "✏️ Спочатку заповни профіль.\n\nВведи своє <b>ПІБ</b>:",
@@ -1280,6 +1374,7 @@ async def main():
             "user_id": actual_user.id,
             "username": actual_user.username or "",
             "section": section or "",
+            "is_admin": is_admin,
         })
 
         async with session_factory() as session:
