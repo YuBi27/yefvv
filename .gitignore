@@ -1,0 +1,8 @@
+.env
+.env.swp
+.nginx.conf.swp
+nginx_b.conf
+.vscode/
+questions.csv
+test.pdf
+questions.sql
