@@ -59,9 +59,9 @@ class UserState(StatesGroup):
     quiz_in_progress = State()
     post_test_score = State()
     broadcast_waiting = State()
-    # Admin question editor
-    edit_search = State()        # searching question by number
-    edit_field = State()         # waiting for new value
+    edit_search = State()
+    edit_field = State()
+    admin_user_mode = State()   # admin browsing as regular user
 
 
 # ---------------------------------------------------------------------------
@@ -136,11 +136,11 @@ def teacher_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def course_keyboard() -> InlineKeyboardMarkup:
+def course_keyboard(level: str = "") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="👉 4 курс", callback_data="funnel:course4")],
-            [InlineKeyboardButton(text="👉 3 курс", callback_data="funnel:course3")],
+            [InlineKeyboardButton(text="👉 4 курс", callback_data=f"funnel:course4:{level}")],
+            [InlineKeyboardButton(text="👉 3 курс", callback_data=f"funnel:course3:{level}")],
         ]
     )
 
@@ -208,6 +208,7 @@ def admin_menu_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="📋 Заявки на розгляді", callback_data="admin:pending")],
             [InlineKeyboardButton(text="✏️ Редагувати питання", callback_data="admin:edit_questions")],
             [InlineKeyboardButton(text="📣 Розсилка", callback_data="admin:broadcast")],
+            [InlineKeyboardButton(text="👤 Режим користувача", callback_data="admin:user_mode")],
         ]
     )
 
@@ -218,10 +219,18 @@ def admin_reply_keyboard() -> ReplyKeyboardMarkup:
         keyboard=[
             [KeyboardButton(text="👥 Користувачі"), KeyboardButton(text="📋 Заявки")],
             [KeyboardButton(text="✏️ Питання"), KeyboardButton(text="📣 Розсилка")],
-            [KeyboardButton(text="🏠 Меню")],
+            [KeyboardButton(text="👤 Режим користувача"), KeyboardButton(text="🏠 Меню")],
         ],
         resize_keyboard=True,
         is_persistent=True,
+    )
+
+
+def back_to_admin_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="👑 Повернутися в панель адміна", callback_data="admin:back_to_admin")],
+        ]
     )
 
 
@@ -360,11 +369,26 @@ async def send_question(bot: Bot, chat_id: int, state: FSMContext, session: Asyn
         user_id: int = data["user_id"]
         username: str = data.get("username", "")
         section_label = data.get("section", "")
+        is_admin: bool = data.get("is_admin", False)
 
         result_obj = UserResult(user_id=user_id, username=username, score=score, total=total)
         session.add(result_obj)
         await session.commit()
         await state.clear()
+
+        # If admin in user mode — show result + back button, skip funnel
+        if is_admin:
+            await safe_send(
+                bot.send_message,
+                chat_id,
+                f"🏁 <b>Тест завершено!</b>"
+                + (f" [{section_label}]" if section_label else "")
+                + f"\n\nРезультат: <b>{score}/{total}</b> ({pct}%)\n\n"
+                "👑 Ти проходив тест у режимі користувача.",
+                parse_mode="HTML",
+                reply_markup=back_to_admin_keyboard(),
+            )
+            return
 
         # Notify user — post-test funnel message #1
         await safe_send(
@@ -385,8 +409,8 @@ async def send_question(bot: Bot, chat_id: int, state: FSMContext, session: Asyn
             ]),
         )
 
-        # Notify admin
-        if ADMIN_ID:
+        # Notify all admins
+        if ADMIN_IDS:
             req = (await session.execute(
                 select(AccessRequest).where(AccessRequest.user_id == user_id)
             )).scalar()
@@ -409,12 +433,13 @@ async def send_question(bot: Bot, chat_id: int, state: FSMContext, session: Asyn
                 + (f"📚 Розділ: {section_label}\n" if section_label else "")
                 + f"🏆 Результат: <b>{score}/{total}</b> ({pct}%)"
             )
-            await safe_send(
-                bot.send_message,
-                ADMIN_ID, admin_text,
-                parse_mode="HTML",
-                reply_markup=write_to_user_keyboard(user_id),
-            )
+            for admin_id in ADMIN_IDS:
+                await safe_send(
+                    bot.send_message,
+                    admin_id, admin_text,
+                    parse_mode="HTML",
+                    reply_markup=write_to_user_keyboard(user_id),
+                )
         return
 
     q_id = q_ids[current]
@@ -504,8 +529,21 @@ async def main():
     # -----------------------------------------------------------------------
     @dp.message(Command("start"))
     async def cmd_start(message: Message, state: FSMContext):
-        # Admin shortcut
-        if message.from_user.id == ADMIN_ID:
+        # Admin shortcut — but check if in user mode first
+        if message.from_user.id in ADMIN_IDS:
+            current_state = await state.get_state()
+            if current_state == UserState.admin_user_mode:
+                # Already in user mode — show quiz menu with back button
+                await message.answer(
+                    "👤 Ти в режимі користувача. Обери формат тесту:",
+                    reply_markup=quiz_menu_keyboard(),
+                )
+                await message.answer(
+                    "↩️ Або повернись в панель адміна:",
+                    reply_markup=back_to_admin_keyboard(),
+                )
+                return
+            # Normal admin start
             await safe_send(
                 message.answer,
                 "👑 Панель адміна — обери дію:",
@@ -541,13 +579,19 @@ async def main():
         else:
             await state.set_state(UserState.waiting_screenshots)
             await message.answer(
-                "👋 Вітаю! Це бот для підготовки до <b>ЄФВВ</b>.\n\n"
-                "Для отримання доступу до тесту потрібно:\n"
-                "1️⃣ Підписатися на Instagram <b>@yevhenia.frolova</b>\n"
-                "2️⃣ Зробити репост вказаного посту\n\n"
-                "📸 Надішли скріншоти підписки та репосту прямо сюди — "
-                "адмін перевірить і надасть доступ.",
+                "🔶 Вітаю! Це бот для Євгенії Фролової — Мами ЄФВВ та ЄДКІ.\n\n"
+                "Щоб отримати доступ до <b>АВТОРСЬКОЇ СИМУЛЯЦІЇ</b> тесту ЄФВВ з права, "
+                "якої <b>НЕМАЄ У ВІДКРИТОМУ ДОСТУПІ</b>, виконайте умови:\n\n"
+                "🤎 1. Підпишіться на Instagram <a href='https://www.instagram.com/yevhenia.frolova'>@yevhenia.frolova</a> — якщо ви ще не підписані.\n\n"
+                "🤎 2. Зробіть репост <b>ЦІЄЇ публікації</b> [вставимо посилання у понеділок] у свої stories з відміткою <b>@yevhenia.frolova</b>\n\n"
+                "🤎 3. Сторіс має бути активна <b>24 години</b>.\n\n"
+                "🤎 4. Сторінка на цей час має бути <b>ВІДКРИТА</b>.\n\n"
+                "🔶 Після виконання умов:\n"
+                "👉 надішліть <b>СКРІНШОТИ</b> підписки та репосту <b>ПРЯМО СЮДИ</b>.\n"
+                "👉 адмін перевірить і надасть <b>ДОСТУП ДО СИМУЛЯЦІЇ</b>.\n\n"
+                "Чекаю на тебе 🤎",
                 parse_mode="HTML",
+                disable_web_page_preview=True,
             )
 
     # -----------------------------------------------------------------------
@@ -710,17 +754,18 @@ async def main():
         await message.answer("✅ Скріншоти отримано! Адмін перевірить і надасть доступ найближчим часом.")
         await state.clear()
 
-        if ADMIN_ID:
-            await bot.forward_message(ADMIN_ID, message.chat.id, message.message_id)
-            await bot.send_message(
-                ADMIN_ID,
-                f"📋 <b>Нова заявка на доступ</b>\n\n"
-                f"👤 {full_name}\n"
-                f"🔗 {username_str}\n"
-                f"🆔 <code>{user.id}</code>",
-                parse_mode="HTML",
-                reply_markup=approve_keyboard(user.id),
-            )
+        if ADMIN_IDS:
+            for admin_id in ADMIN_IDS:
+                await bot.forward_message(admin_id, message.chat.id, message.message_id)
+                await bot.send_message(
+                    admin_id,
+                    f"📋 <b>Нова заявка на доступ</b>\n\n"
+                    f"👤 {full_name}\n"
+                    f"🔗 {username_str}\n"
+                    f"🆔 <code>{user.id}</code>",
+                    parse_mode="HTML",
+                    reply_markup=approve_keyboard(user.id),
+                )
 
     @dp.message(UserState.waiting_screenshots)
     async def waiting_wrong_type(message: Message):
@@ -731,7 +776,7 @@ async def main():
     # -----------------------------------------------------------------------
     @dp.callback_query(F.data.startswith("access:"))
     async def handle_access_decision(callback: CallbackQuery):
-        if callback.from_user.id != ADMIN_ID:
+        if callback.from_user.id not in ADMIN_IDS:
             await callback.answer("⛔ Тільки для адміна.", show_alert=True)
             return
 
@@ -784,7 +829,7 @@ async def main():
     # -----------------------------------------------------------------------
     @dp.message(Command("admin"))
     async def cmd_admin(message: Message):
-        if message.from_user.id != ADMIN_ID:
+        if message.from_user.id not in ADMIN_IDS:
             return
         await safe_send(
             message.answer,
@@ -793,26 +838,82 @@ async def main():
         )
 
     @dp.message(F.text == "🏠 Меню")
-    async def admin_home(message: Message):
-        if message.from_user.id != ADMIN_ID:
+    async def admin_home(message: Message, state: FSMContext):
+        if message.from_user.id not in ADMIN_IDS:
             return
-        await message.answer("Обери дію:", reply_markup=admin_menu_keyboard())
+        # Exit user mode if active
+        await state.clear()
+        await safe_send(
+            message.answer,
+            "👑 Панель адміна — обери дію:",
+            reply_markup=admin_reply_keyboard(),
+        )
+
+    @dp.message(F.text == "👤 Режим користувача")
+    async def admin_user_mode_btn(message: Message, state: FSMContext):
+        if message.from_user.id not in ADMIN_IDS:
+            return
+        await state.set_state(UserState.admin_user_mode)
+        await message.answer(
+            "👤 <b>Режим користувача активовано</b>\n\n"
+            "Тепер ти бачиш бот очима користувача.\n"
+            "Обери формат тесту 👇",
+            parse_mode="HTML",
+            reply_markup=quiz_menu_keyboard(),
+        )
+        await message.answer(
+            "↩️ Повернутися в панель адміна:",
+            reply_markup=back_to_admin_keyboard(),
+        )
+
+    @dp.callback_query(F.data == "admin:user_mode")
+    async def admin_user_mode_cb(callback: CallbackQuery, state: FSMContext):
+        if callback.from_user.id not in ADMIN_IDS:
+            await callback.answer("⛔", show_alert=True)
+            return
+        await callback.answer()
+        await state.set_state(UserState.admin_user_mode)
+        await callback.message.answer(
+            "👤 <b>Режим користувача активовано</b>\n\n"
+            "Тепер ти бачиш бот очима користувача.\n"
+            "Обери формат тесту 👇",
+            parse_mode="HTML",
+            reply_markup=quiz_menu_keyboard(),
+        )
+        await callback.message.answer(
+            "↩️ Повернутися в панель адміна:",
+            reply_markup=back_to_admin_keyboard(),
+        )
+
+    @dp.callback_query(F.data == "admin:back_to_admin")
+    async def back_to_admin_cb(callback: CallbackQuery, state: FSMContext):
+        if callback.from_user.id not in ADMIN_IDS:
+            await callback.answer("⛔", show_alert=True)
+            return
+        await callback.answer()
+        await state.clear()
+        await callback.message.edit_reply_markup(reply_markup=None)
+        await safe_send(
+            callback.message.answer,
+            "👑 Панель адміна — обери дію:",
+            reply_markup=admin_reply_keyboard(),
+        )
 
     @dp.message(F.text == "👥 Користувачі")
     async def admin_users_btn(message: Message):
-        if message.from_user.id != ADMIN_ID:
+        if message.from_user.id not in ADMIN_IDS:
             return
         await _show_results(message)
 
     @dp.message(F.text == "📋 Заявки")
     async def admin_pending_btn(message: Message):
-        if message.from_user.id != ADMIN_ID:
+        if message.from_user.id not in ADMIN_IDS:
             return
         await _show_pending(message)
 
     @dp.message(F.text == "📣 Розсилка")
     async def admin_broadcast_btn(message: Message, state: FSMContext):
-        if message.from_user.id != ADMIN_ID:
+        if message.from_user.id not in ADMIN_IDS:
             return
         await state.set_state(UserState.broadcast_waiting)
         await message.answer(
@@ -825,7 +926,7 @@ async def main():
 
     @dp.callback_query(F.data == "admin:pending")
     async def admin_pending(callback: CallbackQuery):
-        if callback.from_user.id != ADMIN_ID:
+        if callback.from_user.id not in ADMIN_IDS:
             await callback.answer("⛔", show_alert=True)
             return
         await callback.answer()
@@ -914,7 +1015,7 @@ async def main():
 
     @dp.callback_query(F.data == "admin:results")
     async def admin_results(callback: CallbackQuery):
-        if callback.from_user.id != ADMIN_ID:
+        if callback.from_user.id not in ADMIN_IDS:
             await callback.answer("⛔", show_alert=True)
             return
         await callback.answer()
@@ -930,7 +1031,7 @@ async def main():
 
     @dp.callback_query(F.data.startswith("results_page:"))
     async def results_page_cb(callback: CallbackQuery):
-        if callback.from_user.id != ADMIN_ID:
+        if callback.from_user.id not in ADMIN_IDS:
             await callback.answer("⛔", show_alert=True)
             return
         page = int(callback.data.split(":")[1])
@@ -965,7 +1066,7 @@ async def main():
 
     @dp.callback_query(F.data == "admin:broadcast")
     async def admin_broadcast_cb(callback: CallbackQuery, state: FSMContext):
-        if callback.from_user.id != ADMIN_ID:
+        if callback.from_user.id not in ADMIN_IDS:
             await callback.answer("⛔", show_alert=True)
             return
         await callback.answer()
@@ -990,13 +1091,13 @@ async def main():
     # -----------------------------------------------------------------------
     @dp.message(F.text == "✏️ Питання")
     async def admin_edit_btn(message: Message, state: FSMContext):
-        if message.from_user.id != ADMIN_ID:
+        if message.from_user.id not in ADMIN_IDS:
             return
         await _start_edit_questions(message, state)
 
     @dp.callback_query(F.data == "admin:edit_questions")
     async def admin_edit_cb(callback: CallbackQuery, state: FSMContext):
-        if callback.from_user.id != ADMIN_ID:
+        if callback.from_user.id not in ADMIN_IDS:
             await callback.answer("⛔", show_alert=True)
             return
         await callback.answer()
@@ -1012,7 +1113,7 @@ async def main():
 
     @dp.message(UserState.edit_search)
     async def edit_search_handler(message: Message, state: FSMContext):
-        if message.from_user.id != ADMIN_ID:
+        if message.from_user.id not in ADMIN_IDS:
             return
         text = message.text.strip() if message.text else ""
         if not text.isdigit() or not (1 <= int(text) <= 140):
@@ -1053,7 +1154,7 @@ async def main():
 
     @dp.callback_query(F.data.startswith("eq:"))
     async def edit_question_cb(callback: CallbackQuery, state: FSMContext):
-        if callback.from_user.id != ADMIN_ID:
+        if callback.from_user.id not in ADMIN_IDS:
             await callback.answer("⛔", show_alert=True)
             return
         parts = callback.data.split(":")
@@ -1082,7 +1183,7 @@ async def main():
 
     @dp.message(UserState.edit_field)
     async def edit_field_handler(message: Message, state: FSMContext):
-        if message.from_user.id != ADMIN_ID:
+        if message.from_user.id not in ADMIN_IDS:
             return
         data = await state.get_data()
         q_id = data["edit_q_id"]
@@ -1135,7 +1236,7 @@ async def main():
 
     @dp.message(UserState.broadcast_waiting)
     async def do_broadcast(message: Message, state: FSMContext):
-        if message.from_user.id != ADMIN_ID:
+        if message.from_user.id not in ADMIN_IDS:
             return
         await state.clear()
 
@@ -1186,7 +1287,7 @@ async def main():
     # Access check helper
     # -----------------------------------------------------------------------
     async def check_access(message: Message) -> bool:
-        if message.from_user.id == ADMIN_ID:
+        if message.from_user.id in ADMIN_IDS:
             return True
         async with session_factory() as session:
             req = (await session.execute(
@@ -1225,17 +1326,18 @@ async def main():
     # -----------------------------------------------------------------------
     async def start_quiz(message: Message, state: FSMContext, count: int | None = None, user=None, section: str | None = None):
         actual_user = user or message.from_user
+        is_admin = actual_user.id in ADMIN_IDS
 
         async with session_factory() as session:
             req = (await session.execute(
                 select(AccessRequest).where(AccessRequest.user_id == actual_user.id)
             )).scalar()
-        has_access = (req and req.approved) or actual_user.id == ADMIN_ID
+        has_access = (req and req.approved) or is_admin
         if not has_access:
             await message.answer("🔒 Спочатку потрібно отримати доступ. Напиши /start і надішли скріншоти.")
             return
 
-        if req and not req.pib and actual_user.id != ADMIN_ID:
+        if req and not req.pib and not is_admin:
             await state.set_state(UserState.filling_pib)
             await message.answer(
                 "✏️ Спочатку заповни профіль.\n\nВведи своє <b>ПІБ</b>:",
@@ -1272,6 +1374,7 @@ async def main():
             "user_id": actual_user.id,
             "username": actual_user.username or "",
             "section": section or "",
+            "is_admin": is_admin,
         })
 
         async with session_factory() as session:
@@ -1406,14 +1509,16 @@ async def main():
                 "де <b>кожен бал на вагу золота</b>. І дуже часто сильні студенти через невпевненість втрачають бали.\n\n"
                 "В залежності від того, на якому ти курсі, маю <b>два варіанти порад</b>:"
             )
-        await callback.message.answer(text, parse_mode="HTML", reply_markup=course_keyboard())
+        await callback.message.answer(text, parse_mode="HTML", reply_markup=course_keyboard(level))
 
     # -----------------------------------------------------------------------
     # Funnel — course selection (3 or 4)
     # -----------------------------------------------------------------------
     @dp.callback_query(F.data.startswith("funnel:course"))
     async def handle_course_choice(callback: CallbackQuery):
-        course = callback.data.split(":")[1]  # course3 or course4
+        parts = callback.data.split(":")
+        course = parts[1]   # course3 or course4
+        level = parts[2] if len(parts) > 2 else ""
         await callback.message.edit_reply_markup(reply_markup=None)
         await callback.answer()
 
@@ -1436,18 +1541,51 @@ async def main():
                 parse_mode="HTML",
                 reply_markup=restart_keyboard(),
             )
-        else:  # course3
+        else:  # course3 — text depends on score level
+            if level in ("low", "satisf"):
+                text = (
+                    "🔶 Дуже добре, що ви пройшли симуляцію ЄФВВ <b>ЗАЗДАЛЕГІДЬ</b>.\n\n"
+                    "Це вже ваша <b>ПЕРЕВАГА</b>: ви побачили іспит <b>ЗСЕРЕДИНИ</b> і зрозуміли, "
+                    "що підготовка має бути <b>СИСТЕМНОЮ</b>.\n\n"
+                    "🤎 Так, поточний результат — ще не той, на який варто орієнтуватися. "
+                    "Але у вас є <b>ГОЛОВНЕ</b> — <b>ДОСТАТНЬО ЧАСУ</b>, щоб усе виправити.\n\n"
+                    "Більшість не показує високий результат з першої спроби, тому що ЄФВВ — це не лише знання, "
+                    "а й <b>УМІННЯ ПРАЦЮВАТИ У ФОРМАТІ ІСПИТУ</b>.\n\n"
+                    "🔶 Тому зараз найкраще рішення — почати підготовку <b>ЗАВЧАСНО</b> і <b>ПРАВИЛЬНО</b>.\n\n"
+                    "👉 Якщо вас зацікавила підготовка зі мною — розповім деталі та запропоную <b>НАЙВИГІДНІШІ УМОВИ</b>. 🤎"
+                )
+            elif level == "mid":
+                text = (
+                    "🔶 Дуже добре, що ви пройшли симуляцію ЄФВВ <b>ЗАЗДАЛЕГІДЬ</b>.\n\n"
+                    "Ваш результат вже <b>ВИЩЕ СЕРЕДНЬОГО</b> — і це показник, що у вас є <b>СИЛЬНА БАЗА</b>.\n\n"
+                    "🤎 Ви вже бачите іспит <b>ЗСЕРЕДИНИ</b> і розумієте його логіку.\n"
+                    "Але важливо врахувати: на реальному іспиті результат може <b>ПРОСІДАТИ</b>, "
+                    "якщо немає чітко відпрацьованої стратегії роботи з тестом (час, пастки, формулювання).\n\n"
+                    "🔶 Тепер ключове — <b>ДОТИСНУТИ РЕЗУЛЬТАТ ДО ВИСОКОГО РІВНЯ</b> і зробити його <b>СТАБІЛЬНИМ</b>, "
+                    "тому що ЄФВВ — це не лише знання, а й <b>ТОЧНА РОБОТА У ФОРМАТІ ІСПИТУ</b>.\n\n"
+                    "🔶 Саме зараз найкращий момент, щоб системно допрацювати слабкі місця і вийти на <b>МАКСИМУМ</b>.\n\n"
+                    "👉 Якщо хочете підсилити результат і впевнено показати його на іспиті — "
+                    "розповім деталі підготовки та запропоную <b>НАЙВИГІДНІШІ УМОВИ</b>. 🤎"
+                )
+            else:  # high
+                text = (
+                    "🔶 Дуже добре, що ви пройшли симуляцію ЄФВВ <b>ЗАЗДАЛЕГІДЬ</b>.\n\n"
+                    "Це ваша <b>ПЕРЕВАГА</b>: ви вже бачите іспит <b>ЗСЕРЕДИНИ</b> і розумієте його логіку.\n\n"
+                    "🤎 Ваш результат уже <b>ВИСОКИЙ</b>, але важливо інше — "
+                    "<b>ЧИ ЗМОЖЕТЕ ВИ ЙОГО ПОВТОРИТИ НА ІСПИТІ</b>.\n\n"
+                    "Без системної підготовки навіть сильні студенти <b>ВТРАЧАЮТЬ БАЛИ</b> "
+                    "через формат, час і неочевидні пастки тесту.\n\n"
+                    "🔶 Зараз ключове — <b>ЗАКРІПИТИ РЕЗУЛЬТАТ</b> і <b>ДОТИСНУТИ ЙОГО ДО МАКСИМУМУ</b>.\n"
+                    "Саме тут і починається <b>СПЕЦИФІЧНА ПІДГОТОВКА ДЛЯ ВІДМІННИКІВ</b>.\n\n"
+                    "👉 Якщо хочете не просто «добре скласти», а <b>ГАРАНТОВАНО УТРИМАТИ ВИСОКИЙ РІВЕНЬ</b> — "
+                    "напишіть, розповім деталі та запропоную <b>НАЙКРАЩІ УМОВИ</b>. 🤎"
+                )
+
             await callback.message.answer(
-                "✅ Це дуже добре, що ви пройшли симуляцію ЄФВВ <b>ЗАЗДАЛЕГІДЬ</b>. "
-                "Зараз ви вже розумієте, як виглядає іспит зсередини, і бачите <b>НЕОБХІДНІСТЬ ПІДГОТОВКИ</b> через отриманий результат.\n\n"
-                "💛 Але для заспокоєння скажу: у вас ще є <b>ДОСТАТНЬО ЧАСУ</b>. "
-                "Більшість з першого разу не отримує бажаний результат, тому що ЄФВВ — це не лише про знання, "
-                "а про <b>СПЕЦІАЛЬНУ ПІДГОТОВКУ</b> до формату іспиту.\n\n"
-                "👉 Якщо ви розглядаєте підготовку на моєму курсі — розповім деталі та запропоную <b>НАЙВИГІДНІШІ УМОВИ</b>.",
+                text,
                 parse_mode="HTML",
                 reply_markup=interested_keyboard(),
             )
-            # Schedule warm-up message after 3-12 hours (we use a simple delayed task)
             asyncio.create_task(_send_warmup(bot, callback.from_user.id, delay_hours=6))
 
     # -----------------------------------------------------------------------

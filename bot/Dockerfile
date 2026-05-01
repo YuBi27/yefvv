@@ -12,6 +12,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 # Parse PDF and generate questions.json at build time
-RUN python parse_pdf.py test.pdf > questions.json
+# RUN python parse_pdf.py test.pdf > questions.json
 
 CMD ["python", "bot.py"]
