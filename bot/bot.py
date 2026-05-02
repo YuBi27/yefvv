@@ -22,6 +22,7 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
 )
+from aiogram.client.default import DefaultBotProperties
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
@@ -521,7 +522,7 @@ async def main():
             await session.commit()
             logger.info("Seeded %d questions", len(qs))
 
-    bot = Bot(token=BOT_TOKEN)
+    bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML", protect_content=True,))
     dp = Dispatcher(storage=storage)
 
     # -----------------------------------------------------------------------
@@ -569,7 +570,7 @@ async def main():
                     parse_mode="HTML",
                 )
         elif req and req.status == "pending":
-            await message.answer("⏳ Твоя заявка вже на розгляді. Очікуй підтвердження від адміна.")
+            await message.answer("⏳ Твоя заявка вже на розгляді. Очікуй підтвердження від адміністратора.")
         elif req and req.status == "rejected":
             await message.answer(
                 "❌ На жаль, твою заявку відхилено.\n"
@@ -579,16 +580,16 @@ async def main():
         else:
             await state.set_state(UserState.waiting_screenshots)
             await message.answer(
-                "🔶 Вітаю! Це бот для Євгенії Фролової — Мами ЄФВВ та ЄДКІ.\n\n"
+                "🔶 Вітаю! Це бот Євгенії Фролової — Мами ЄФВВ та ЄДКІ.\n\n"
                 "Щоб отримати доступ до <b>АВТОРСЬКОЇ СИМУЛЯЦІЇ</b> тесту ЄФВВ з права, "
                 "якої <b>НЕМАЄ У ВІДКРИТОМУ ДОСТУПІ</b>, виконайте умови:\n\n"
                 "🤎 1. Підпишіться на Instagram <a href='https://www.instagram.com/yevhenia.frolova'>@yevhenia.frolova</a> — якщо ви ще не підписані.\n\n"
-                "🤎 2. Зробіть репост <b>ЦІЄЇ публікації</b> [вставимо посилання у понеділок] у свої stories з відміткою <b>@yevhenia.frolova</b>\n\n"
+                "🤎 2. Зробіть репост <b>ЦІЄЇ публікації</b> [вставимо посилання у понеділок] у свої stories з відміткою <a href='https://www.instagram.com/yevhenia.frolova'>@yevhenia.frolova</a>\n\n"
                 "🤎 3. Сторіс має бути активна <b>24 години</b>.\n\n"
                 "🤎 4. Сторінка на цей час має бути <b>ВІДКРИТА</b>.\n\n"
                 "🔶 Після виконання умов:\n"
                 "👉 надішліть <b>СКРІНШОТИ</b> підписки та репосту <b>ПРЯМО СЮДИ</b>.\n"
-                "👉 адмін перевірить і надасть <b>ДОСТУП ДО СИМУЛЯЦІЇ</b>.\n\n"
+                "👉 адміністратор перевірить і надасть <b>ДОСТУП ДО СИМУЛЯЦІЇ</b>.\n\n"
                 "Чекаю на тебе 🤎",
                 parse_mode="HTML",
                 disable_web_page_preview=True,
@@ -751,7 +752,7 @@ async def main():
                 ))
                 await session.commit()
 
-        await message.answer("✅ Скріншоти отримано! Адмін перевірить і надасть доступ найближчим часом.")
+        await message.answer("✅ Скріншоти отримано! Адміністратор перевірить і надасть доступ найближчим часом.")
         await state.clear()
 
         if ADMIN_IDS:
