@@ -2117,6 +2117,17 @@ async def main():
     asyncio.create_task(auto_cleanup())
 
     # -----------------------------------------------------------------------
+    # Set bot commands (shows "Start" button in empty chats)
+    # -----------------------------------------------------------------------
+    from aiogram.types import BotCommand
+    await bot.set_my_commands([
+        BotCommand(command="start", description="🚀 Розпочати / Головне меню"),
+        BotCommand(command="quiz", description="📝 Пройти тест"),
+        BotCommand(command="stats", description="📊 Мої результати"),
+        BotCommand(command="cancel", description="❌ Скасувати поточну дію"),
+    ])
+
+    # -----------------------------------------------------------------------
     # Webhook or polling
     # -----------------------------------------------------------------------
     if WEBHOOK_DOMAIN:
