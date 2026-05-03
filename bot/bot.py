@@ -1757,7 +1757,7 @@ async def main():
                 protect_content=True,
             )
             await state.update_data(score=score, current=current + 1)
-            await asyncio.sleep(2.0)
+            await asyncio.sleep(4.0)
 
             # Delete feedback before showing next question
             if feedback_msg:
@@ -1808,7 +1808,32 @@ async def main():
 
     @dp.message(UserState.quiz_quit_comment)
     async def quiz_quit_save(message: Message, state: FSMContext):
-        comment = message.text.strip() if message.text else "—"
+        # Validate comment — must be non-empty text, at least 5 characters
+        if not message.text:
+            await message.answer(
+                "⚠️ <b>Коментар обов'язковий!</b>\n\n"
+                "Будь ласка, напиши текстом причину завершення тесту.\n"
+                "Без коментаря перервати тест неможливо.",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="↩️ Продовжити тест", callback_data="quiz:resume")],
+                ]),
+            )
+            return
+
+        comment = message.text.strip()
+        if len(comment) < 5:
+            await message.answer(
+                "⚠️ <b>Коментар занадто короткий!</b>\n\n"
+                "Напиши будь ласка детальніше — мінімум 5 символів.\n"
+                "Без коментаря перервати тест неможливо.",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="↩️ Продовжити тест", callback_data="quiz:resume")],
+                ]),
+            )
+            return
+
         data = await state.get_data()
         user_id = data.get("user_id", message.from_user.id)
         username = data.get("username", message.from_user.username or "")
