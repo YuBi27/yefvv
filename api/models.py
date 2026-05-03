@@ -27,6 +27,10 @@ class UserResult(Base):
     username: Mapped[str] = mapped_column(String, default="")
     score: Mapped[int] = mapped_column(Integer, nullable=False)
     total: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Quiz progress tracking
+    section: Mapped[str] = mapped_column(String, default="")          # which section/mode
+    stopped_at: Mapped[int] = mapped_column(Integer, default=0)       # question number where stopped (0 = completed)
+    completed: Mapped[bool] = mapped_column(Boolean, default=True)    # False if timed out / abandoned
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 

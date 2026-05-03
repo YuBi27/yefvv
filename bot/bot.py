@@ -60,6 +60,7 @@ class UserState(StatesGroup):
     quiz_in_progress = State()
     post_test_score = State()
     broadcast_waiting = State()
+    broadcast_filter_set = State()   # admin chose filter, waiting for message
     edit_search = State()
     edit_field = State()
     admin_user_mode = State()   # admin browsing as regular user
@@ -205,8 +206,8 @@ def write_to_user_keyboard(user_id: int) -> InlineKeyboardMarkup:
 def admin_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="👥 Користувачі які пройшли тест", callback_data="admin:results")],
-            [InlineKeyboardButton(text="📋 Заявки на розгляді", callback_data="admin:pending")],
+            [InlineKeyboardButton(text="📋 Список користувачів які пройшли тест", callback_data="admin:results")],
+            [InlineKeyboardButton(text="📝 Заявки на розгляді", callback_data="admin:pending")],
             [InlineKeyboardButton(text="✏️ Редагувати питання", callback_data="admin:edit_questions")],
             [InlineKeyboardButton(text="📣 Розсилка", callback_data="admin:broadcast")],
             [InlineKeyboardButton(text="👤 Режим користувача", callback_data="admin:user_mode")],
@@ -218,9 +219,9 @@ def admin_reply_keyboard() -> ReplyKeyboardMarkup:
     """Persistent bottom keyboard for admin."""
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="👥 Користувачі"), KeyboardButton(text="📋 Заявки")],
+            [KeyboardButton(text="📋 Список користувачів"), KeyboardButton(text="📝 Заявки")],
             [KeyboardButton(text="✏️ Питання"), KeyboardButton(text="📣 Розсилка")],
-            [KeyboardButton(text="👤 Режим користувача"), KeyboardButton(text="🏠 Меню")],
+            [KeyboardButton(text="👤 Режим користувача")],
         ],
         resize_keyboard=True,
         is_persistent=True,
@@ -372,7 +373,15 @@ async def send_question(bot: Bot, chat_id: int, state: FSMContext, session: Asyn
         section_label = data.get("section", "")
         is_admin: bool = data.get("is_admin", False)
 
-        result_obj = UserResult(user_id=user_id, username=username, score=score, total=total)
+        result_obj = UserResult(
+            user_id=user_id,
+            username=username,
+            score=score,
+            total=total,
+            section=section_label,
+            stopped_at=0,
+            completed=True,
+        )
         session.add(result_obj)
         await session.commit()
         await state.clear()
@@ -900,7 +909,7 @@ async def main():
             reply_markup=admin_reply_keyboard(),
         )
 
-    @dp.message(F.text == "👥 Користувачі")
+    @dp.message(F.text == "📋 Список користувачів")
     async def admin_users_btn(message: Message):
         if message.from_user.id not in ADMIN_IDS:
             return
@@ -916,14 +925,7 @@ async def main():
     async def admin_broadcast_btn(message: Message, state: FSMContext):
         if message.from_user.id not in ADMIN_IDS:
             return
-        await state.set_state(UserState.broadcast_waiting)
-        await message.answer(
-            "📣 <b>Розсилка</b>\n\n"
-            "Надішли повідомлення для розсилки (текст, фото, відео, документ).\n"
-            "Воно буде відправлено всім користувачам бота.\n\n"
-            "Для скасування напиши /cancel",
-            parse_mode="HTML",
-        )
+        await _start_broadcast(message, state)
 
     @dp.callback_query(F.data == "admin:pending")
     async def admin_pending(callback: CallbackQuery):
@@ -963,11 +965,17 @@ async def main():
         if page < total_pages - 1:
             nav.append(InlineKeyboardButton(text="▶️", callback_data=f"results_page:{page+1}"))
         buttons.append(nav)
-        buttons.append([InlineKeyboardButton(text="🔄 Оновити", callback_data="results_page:0")])
+        buttons.append([
+            InlineKeyboardButton(text="🔄 Оновити", callback_data="results_page:0"),
+        ])
+        buttons.append([
+            InlineKeyboardButton(text="📥 Експорт CSV", callback_data="results_export:csv"),
+            InlineKeyboardButton(text="📊 Експорт Excel", callback_data="results_export:xlsx"),
+        ])
         return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-    async def _get_results_page(page: int) -> tuple[str, int, int]:
-        """Returns (text, total_pages, total_count)."""
+    async def _fetch_all_results():
+        """Fetch all results within 7 days with profiles."""
         from datetime import datetime, timedelta
         cutoff = datetime.utcnow() - timedelta(days=7)
         async with session_factory() as session:
@@ -976,22 +984,27 @@ async def main():
                 .where(UserResult.created_at >= cutoff)
                 .order_by(UserResult.created_at.desc())
             )).scalars().all()
-
             if not all_results:
-                return "За останні 7 днів ніхто не проходив тест.", 0, 0
-
-            total = len(all_results)
-            total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
-            page = max(0, min(page, total_pages - 1))
-            chunk = all_results[page * PAGE_SIZE:(page + 1) * PAGE_SIZE]
-
-            user_ids = [r.user_id for r in chunk]
+                return [], {}
+            user_ids = list({r.user_id for r in all_results})
             reqs = (await session.execute(
                 select(AccessRequest).where(AccessRequest.user_id.in_(user_ids))
             )).scalars().all()
             profiles = {r.user_id: r for r in reqs}
+        return all_results, profiles
 
-        lines = [f"📊 <b>Результати за 7 днів</b> — всього {total} проходжень\n"]
+    async def _get_results_page(page: int) -> tuple[str, int, int]:
+        """Returns (text, total_pages, total_count)."""
+        all_results, profiles = await _fetch_all_results()
+        if not all_results:
+            return "За останні 7 днів ніхто не проходив тест.", 0, 0
+
+        total = len(all_results)
+        total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+        page = max(0, min(page, total_pages - 1))
+        chunk = all_results[page * PAGE_SIZE:(page + 1) * PAGE_SIZE]
+
+        lines = [f"📊 <b>Список користувачів які пройшли тест</b>\nЗа 7 днів: {total} проходжень\n"]
         for i, r in enumerate(chunk, page * PAGE_SIZE + 1):
             prof = profiles.get(r.user_id)
             pib = prof.pib if prof and prof.pib else "—"
@@ -1003,16 +1016,137 @@ async def main():
             uname = f"@{r.username}" if r.username else "—"
             pct = r.score * 100 // r.total
             date_str = r.created_at.strftime("%d.%m %H:%M") if r.created_at else "—"
+
+            # Test info
+            section_info = r.section if r.section else "Повний тест"
+            if r.completed:
+                test_status = f"✅ Завершено ({r.score}/{r.total}, {pct}%)"
+            else:
+                test_status = f"⏸ Зупинився на питанні {r.stopped_at}/{r.total}"
+
             lines.append(
                 f"<b>#{i}</b> 👤 {pib}\n"
                 f"   🔗 {uname}  🆔 <code>{r.user_id}</code>\n"
                 f"   📞 {phone}  📧 {email}\n"
                 f"   🏫 {study} ({course_val})\n"
                 f"   📸 {insta}\n"
-                f"   🏆 <b>{r.score}/{r.total}</b> ({pct}%)  📅 {date_str}"
+                f"   📚 {section_info}\n"
+                f"   {test_status}  📅 {date_str}"
             )
 
         return "\n\n".join(lines), total_pages, total
+
+    def _build_csv(all_results, profiles) -> bytes:
+        import csv, io
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow([
+            "№", "ПІБ", "Telegram", "Телефон", "Email",
+            "Навчання", "Курс", "Instagram", "Розділ",
+            "Статус", "Бал", "Всього", "%", "Зупинився на питанні", "Дата"
+        ])
+        for i, r in enumerate(all_results, 1):
+            prof = profiles.get(r.user_id)
+            pct = r.score * 100 // r.total
+            status = "Завершено" if r.completed else "Не завершено"
+            writer.writerow([
+                i,
+                prof.pib if prof else "",
+                f"@{r.username}" if r.username else "",
+                prof.phone if prof else "",
+                prof.email if prof else "",
+                prof.study_place if prof else "",
+                prof.course if prof else "",
+                prof.instagram if prof else "",
+                r.section or "Повний тест",
+                status,
+                r.score, r.total, pct,
+                r.stopped_at if not r.completed else "",
+                r.created_at.strftime("%d.%m.%Y %H:%M") if r.created_at else "",
+            ])
+        return buf.getvalue().encode("utf-8-sig")
+
+    def _build_xlsx(all_results, profiles) -> bytes:
+        import io
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, PatternFill, Alignment
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Результати"
+
+        headers = [
+            "№", "ПІБ", "Telegram", "Телефон", "Email",
+            "Навчання", "Курс", "Instagram", "Розділ",
+            "Статус", "Бал", "Всього", "%", "Зупинився на питанні", "Дата"
+        ]
+        header_fill = PatternFill("solid", fgColor="4472C4")
+        header_font = Font(bold=True, color="FFFFFF")
+        for col, h in enumerate(headers, 1):
+            cell = ws.cell(row=1, column=col, value=h)
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal="center")
+
+        for i, r in enumerate(all_results, 1):
+            prof = profiles.get(r.user_id)
+            pct = r.score * 100 // r.total
+            status = "Завершено" if r.completed else "Не завершено"
+            row = [
+                i,
+                prof.pib if prof else "",
+                f"@{r.username}" if r.username else "",
+                prof.phone if prof else "",
+                prof.email if prof else "",
+                prof.study_place if prof else "",
+                prof.course if prof else "",
+                prof.instagram if prof else "",
+                r.section or "Повний тест",
+                status,
+                r.score, r.total, pct,
+                r.stopped_at if not r.completed else "",
+                r.created_at.strftime("%d.%m.%Y %H:%M") if r.created_at else "",
+            ]
+            for col, val in enumerate(row, 1):
+                ws.cell(row=i + 1, column=col, value=val)
+            # Color row red if not completed
+            if not r.completed:
+                for col in range(1, len(headers) + 1):
+                    ws.cell(row=i + 1, column=col).fill = PatternFill("solid", fgColor="FFE0E0")
+
+        # Auto column width
+        for col in ws.columns:
+            max_len = max((len(str(c.value or "")) for c in col), default=0)
+            ws.column_dimensions[col[0].column_letter].width = min(max_len + 4, 40)
+
+        buf = io.BytesIO()
+        wb.save(buf)
+        return buf.getvalue()
+
+    @dp.callback_query(F.data.startswith("results_export:"))
+    async def results_export_cb(callback: CallbackQuery):
+        if callback.from_user.id not in ADMIN_IDS:
+            await callback.answer("⛔", show_alert=True)
+            return
+        fmt = callback.data.split(":")[1]
+        await callback.answer("⏳ Генерую файл...")
+
+        all_results, profiles = await _fetch_all_results()
+        if not all_results:
+            await callback.message.answer("Немає даних для експорту.")
+            return
+
+        from aiogram.types import BufferedInputFile
+        from datetime import datetime
+        ts = datetime.now().strftime("%Y%m%d_%H%M")
+
+        if fmt == "csv":
+            data = _build_csv(all_results, profiles)
+            file = BufferedInputFile(data, filename=f"results_{ts}.csv")
+            await callback.message.answer_document(file, caption="📥 Експорт CSV")
+        else:
+            data = _build_xlsx(all_results, profiles)
+            file = BufferedInputFile(data, filename=f"results_{ts}.xlsx")
+            await callback.message.answer_document(file, caption="📊 Експорт Excel")
 
     @dp.callback_query(F.data == "admin:results")
     async def admin_results(callback: CallbackQuery):
@@ -1071,14 +1205,7 @@ async def main():
             await callback.answer("⛔", show_alert=True)
             return
         await callback.answer()
-        await state.set_state(UserState.broadcast_waiting)
-        await callback.message.answer(
-            "📣 <b>Розсилка</b>\n\n"
-            "Надішли повідомлення для розсилки (текст, фото, відео, документ).\n"
-            "Воно буде відправлено всім користувачам бота.\n\n"
-            "Для скасування напиши /cancel",
-            parse_mode="HTML",
-        )
+        await _start_broadcast(callback.message, state)
 
     @dp.message(Command("cancel"))
     async def cmd_cancel(message: Message, state: FSMContext):
@@ -1235,28 +1362,162 @@ async def main():
             ]),
         )
 
-    @dp.message(UserState.broadcast_waiting)
-    async def do_broadcast(message: Message, state: FSMContext):
+    # -----------------------------------------------------------------------
+    # Broadcast — filter keyboard and logic
+    # -----------------------------------------------------------------------
+    def broadcast_filter_keyboard() -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="👥 Всі користувачі", callback_data="bcast_filter:all")],
+            [InlineKeyboardButton(text="✅ Пройшли тест до кінця", callback_data="bcast_filter:completed")],
+            [InlineKeyboardButton(text="⏸ Не завершили тест", callback_data="bcast_filter:not_completed")],
+            [InlineKeyboardButton(text="🔴 Погано (до 35 балів)", callback_data="bcast_filter:score_low")],
+            [InlineKeyboardButton(text="🟠 Задовільно (35–50)", callback_data="bcast_filter:score_satisf")],
+            [InlineKeyboardButton(text="🟡 Середньо (51–80)", callback_data="bcast_filter:score_mid")],
+            [InlineKeyboardButton(text="🟢 Добре (81–140)", callback_data="bcast_filter:score_high")],
+            [InlineKeyboardButton(text="🎓 3 курс", callback_data="bcast_filter:course3"),
+             InlineKeyboardButton(text="🎓 4 курс", callback_data="bcast_filter:course4")],
+            [InlineKeyboardButton(text="🆕 Ще не починали тест", callback_data="bcast_filter:no_test")],
+            [InlineKeyboardButton(text="❌ Скасувати", callback_data="bcast_filter:cancel")],
+        ])
+
+    FILTER_LABELS = {
+        "all": "👥 Всі користувачі",
+        "completed": "✅ Пройшли тест до кінця",
+        "not_completed": "⏸ Не завершили тест",
+        "score_low": "🔴 Погано (до 35 балів)",
+        "score_satisf": "🟠 Задовільно (35–50)",
+        "score_mid": "🟡 Середньо (51–80)",
+        "score_high": "🟢 Добре (81–140)",
+        "course3": "🎓 3 курс",
+        "course4": "🎓 4 курс",
+        "no_test": "🆕 Ще не починали тест",
+    }
+
+    async def _get_broadcast_users(filter_key: str) -> list[int]:
+        from datetime import datetime, timedelta
+        cutoff = datetime.utcnow() - timedelta(days=7)
+        async with session_factory() as session:
+            if filter_key == "all":
+                return list((await session.execute(
+                    select(AccessRequest.user_id).where(AccessRequest.approved == True)
+                )).scalars().all())
+
+            elif filter_key == "no_test":
+                tested = set((await session.execute(
+                    select(UserResult.user_id).where(UserResult.created_at >= cutoff).distinct()
+                )).scalars().all())
+                all_approved = (await session.execute(
+                    select(AccessRequest.user_id).where(AccessRequest.approved == True)
+                )).scalars().all()
+                return [uid for uid in all_approved if uid not in tested]
+
+            elif filter_key == "completed":
+                return list((await session.execute(
+                    select(UserResult.user_id)
+                    .where(UserResult.created_at >= cutoff, UserResult.completed == True)
+                    .distinct()
+                )).scalars().all())
+
+            elif filter_key == "not_completed":
+                return list((await session.execute(
+                    select(UserResult.user_id)
+                    .where(UserResult.created_at >= cutoff, UserResult.completed == False)
+                    .distinct()
+                )).scalars().all())
+
+            elif filter_key.startswith("score_"):
+                level = filter_key[6:]
+                results = (await session.execute(
+                    select(UserResult)
+                    .where(UserResult.created_at >= cutoff, UserResult.completed == True)
+                )).scalars().all()
+                uid_set = set()
+                for r in results:
+                    pct = r.score * 100 // r.total
+                    if level == "low" and pct <= 25:
+                        uid_set.add(r.user_id)
+                    elif level == "satisf" and 26 <= pct <= 36:
+                        uid_set.add(r.user_id)
+                    elif level == "mid" and 37 <= pct <= 57:
+                        uid_set.add(r.user_id)
+                    elif level == "high" and pct >= 58:
+                        uid_set.add(r.user_id)
+                return list(uid_set)
+
+            elif filter_key in ("course3", "course4"):
+                course_num = filter_key[-1]
+                return list((await session.execute(
+                    select(AccessRequest.user_id)
+                    .where(
+                        AccessRequest.approved == True,
+                        AccessRequest.course.like(f"%{course_num}%"),
+                    )
+                )).scalars().all())
+        return []
+
+    async def _start_broadcast(target: Message, state: FSMContext):
+        await state.set_state(UserState.broadcast_waiting)
+        await target.answer(
+            "📣 <b>Розсилка</b>\n\nОбери <b>кому</b> надіслати:",
+            parse_mode="HTML",
+            reply_markup=broadcast_filter_keyboard(),
+        )
+
+    @dp.callback_query(F.data.startswith("bcast_filter:"))
+    async def broadcast_filter_chosen(callback: CallbackQuery, state: FSMContext):
+        if callback.from_user.id not in ADMIN_IDS:
+            await callback.answer("⛔", show_alert=True)
+            return
+        filter_key = callback.data.split(":")[1]
+        await callback.answer()
+
+        if filter_key == "cancel":
+            await state.clear()
+            await callback.message.edit_reply_markup(reply_markup=None)
+            await callback.message.answer("❌ Розсилку скасовано.")
+            return
+
+        user_ids = await _get_broadcast_users(filter_key)
+        label = FILTER_LABELS.get(filter_key, filter_key)
+
+        if not user_ids:
+            await callback.message.answer(f"⚠️ За фільтром «{label}» не знайдено жодного користувача.")
+            return
+
+        await state.set_state(UserState.broadcast_filter_set)
+        await state.update_data(broadcast_filter=filter_key, broadcast_user_ids=user_ids)
+        await callback.message.edit_reply_markup(reply_markup=None)
+        await callback.message.answer(
+            f"✅ Фільтр: <b>{label}</b>\n"
+            f"👥 Отримувачів: <b>{len(user_ids)}</b>\n\n"
+            "📩 Надішли повідомлення для розсилки\n"
+            "(текст, фото, відео, документ — будь-який формат).\n\n"
+            "Для скасування: /cancel",
+            parse_mode="HTML",
+        )
+
+    @dp.message(UserState.broadcast_filter_set)
+    async def do_broadcast_filtered(message: Message, state: FSMContext):
         if message.from_user.id not in ADMIN_IDS:
             return
+        data = await state.get_data()
+        user_ids: list[int] = data.get("broadcast_user_ids", [])
+        filter_key = data.get("broadcast_filter", "all")
+        label = FILTER_LABELS.get(filter_key, filter_key)
         await state.clear()
 
-        # Collect all unique user_ids from access_requests
-        async with session_factory() as session:
-            rows = (await session.execute(
-                select(AccessRequest.user_id).where(AccessRequest.approved == True)
-            )).scalars().all()
-
-        if not rows:
+        if not user_ids:
             await message.answer("Немає користувачів для розсилки.")
             return
 
-        await message.answer(f"⏳ Починаю розсилку для {len(rows)} користувачів...")
-
+        await message.answer(
+            f"⏳ Починаю розсилку для <b>{len(user_ids)}</b> користувачів ({label})...",
+            parse_mode="HTML",
+        )
         sent, failed = 0, 0
-        for user_id in rows:
+        for user_id in user_ids:
             try:
-                await asyncio.sleep(0.05)  # ~20 msg/sec — safe rate
+                await asyncio.sleep(0.05)
                 await bot.copy_message(
                     chat_id=user_id,
                     from_chat_id=message.chat.id,
@@ -1279,10 +1540,19 @@ async def main():
                 failed += 1
 
         await message.answer(
-            f"✅ Розсилка завершена!\n"
-            f"Надіслано: {sent}\n"
-            f"Помилок: {failed}"
+            f"✅ <b>Розсилка завершена!</b>\n\n"
+            f"🎯 Фільтр: {label}\n"
+            f"📤 Надіслано: <b>{sent}</b>\n"
+            f"❌ Помилок: <b>{failed}</b>",
+            parse_mode="HTML",
         )
+
+    @dp.message(UserState.broadcast_waiting)
+    async def do_broadcast(message: Message, state: FSMContext):
+        # Show filter selection again if user sends message without choosing filter
+        if message.from_user.id not in ADMIN_IDS:
+            return
+        await _start_broadcast(message, state)
 
     # -----------------------------------------------------------------------
     # Access check helper
