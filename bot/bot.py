@@ -940,7 +940,7 @@ async def main():
             return
         await _show_results(message)
 
-    @dp.message(F.text == "� Заявки")
+    @dp.message(F.text == "📝 Заявки")
     async def admin_pending_btn(message: Message):
         if message.from_user.id not in ADMIN_IDS:
             return
