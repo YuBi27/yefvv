@@ -58,6 +58,7 @@ class UserState(StatesGroup):
     filling_email = State()
     filling_instagram = State()
     quiz_in_progress = State()
+    quiz_quit_comment = State()  # waiting for quit reason comment
     post_test_score = State()
     broadcast_waiting = State()
     broadcast_filter_set = State()   # admin chose filter, waiting for message
@@ -462,7 +463,8 @@ async def send_question(bot: Bot, chat_id: int, state: FSMContext, session: Asyn
     )
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=chr(65+i), callback_data=f"ans:{q_id}:{i}")
-         for i in range(len(q.options))]
+         for i in range(len(q.options))],
+        [InlineKeyboardButton(text="🚪 Завершити тест", callback_data="quiz:quit")],
     ])
 
     # Cancel any existing timer for this chat
@@ -1727,6 +1729,101 @@ async def main():
             await state.update_data(score=score, current=current + 1)
             await asyncio.sleep(2.0)
             await send_question(bot, callback.message.chat.id, state, session, session_factory)
+
+    # -----------------------------------------------------------------------
+    # Quiz quit — user presses "🚪 Завершити тест"
+    # -----------------------------------------------------------------------
+    @dp.callback_query(F.data == "quiz:quit", UserState.quiz_in_progress)
+    async def quiz_quit_confirm(callback: CallbackQuery, state: FSMContext):
+        await callback.answer()
+        data = await state.get_data()
+        current = data.get("current", 0)
+        total = len(data.get("q_ids", []))
+
+        # Remove answer buttons from current question
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+
+        # Cancel timer
+        cancel_timer(callback.message.chat.id)
+
+        await state.set_state(UserState.quiz_quit_comment)
+        await callback.message.answer(
+            f"⚠️ Ти збираєшся завершити тест на питанні <b>{current + 1}/{total}</b>.\n\n"
+            "📝 Напиши будь ласка <b>причину</b>, чому вирішив завершити тест раніше часу:",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="↩️ Продовжити тест", callback_data="quiz:resume")],
+            ]),
+        )
+
+    @dp.callback_query(F.data == "quiz:resume", UserState.quiz_quit_comment)
+    async def quiz_resume(callback: CallbackQuery, state: FSMContext):
+        await callback.answer()
+        await callback.message.edit_reply_markup(reply_markup=None)
+        await state.set_state(UserState.quiz_in_progress)
+        await callback.message.answer("▶️ Продовжуємо тест!")
+        async with session_factory() as session:
+            await send_question(bot, callback.message.chat.id, state, session, session_factory)
+
+    @dp.message(UserState.quiz_quit_comment)
+    async def quiz_quit_save(message: Message, state: FSMContext):
+        comment = message.text.strip() if message.text else "—"
+        data = await state.get_data()
+        user_id = data.get("user_id", message.from_user.id)
+        username = data.get("username", message.from_user.username or "")
+        score = data.get("score", 0)
+        current = data.get("current", 0)
+        q_ids = data.get("q_ids", [])
+        total = len(q_ids)
+        section_label = data.get("section", "")
+
+        # Save incomplete result
+        async with session_factory() as session:
+            result_obj = UserResult(
+                user_id=user_id,
+                username=username,
+                score=score,
+                total=total,
+                section=section_label,
+                stopped_at=current + 1,
+                completed=False,
+            )
+            session.add(result_obj)
+            await session.commit()
+
+        await state.clear()
+        cancel_timer(message.chat.id)
+
+        await message.answer(
+            f"📋 <b>Тест завершено достроково</b>\n\n"
+            f"Питань пройдено: <b>{current}/{total}</b>\n"
+            f"Правильних відповідей: <b>{score}</b>\n\n"
+            f"💬 Твій коментар: <i>{comment}</i>\n\n"
+            "Дякуємо за відгук! Якщо захочеш — можеш пройти тест знову 👇",
+            parse_mode="HTML",
+            reply_markup=quiz_menu_keyboard(),
+        )
+
+        # Notify admins
+        if ADMIN_IDS:
+            for admin_id in ADMIN_IDS:
+                try:
+                    await bot.send_message(
+                        admin_id,
+                        f"⚠️ <b>Користувач завершив тест достроково</b>\n\n"
+                        f"👤 @{username} (<code>{user_id}</code>)\n"
+                        f"📊 Пройдено: {current}/{total} питань\n"
+                        f"✅ Правильних: {score}\n"
+                        + (f"📚 Розділ: {section_label}\n" if section_label else "")
+                        + f"\n💬 Причина: <i>{comment}</i>",
+                        parse_mode="HTML",
+                        reply_markup=write_to_user_keyboard(user_id),
+                    )
+                except Exception:
+                    pass
 
     # -----------------------------------------------------------------------
     # Post-test funnel — score range selection
