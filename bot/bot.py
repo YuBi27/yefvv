@@ -321,32 +321,36 @@ async def run_timer(
         if not data or data.get("current", -1) != q_num - 1:
             return
 
-        # Mark as timeout — remove buttons, show message, advance
-        try:
-            await bot.edit_message_reply_markup(chat_id=chat_id, message_id=timer_msg_id - 1, reply_markup=None)
-        except Exception:
-            pass
-        try:
-            await bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=timer_msg_id,
-                text=f"⏱ <b>Питання {q_num}/{q_total}</b>\n🔴 ⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ <b>0:00</b>",
-                parse_mode="HTML",
-            )
-        except Exception:
-            pass
+        q_msg_id_saved = data.get("q_msg_id", 0)
 
-        await safe_send(
+        # Delete question message and timer message
+        for msg_id in [q_msg_id_saved, timer_msg_id]:
+            if msg_id:
+                try:
+                    await bot.delete_message(chat_id=chat_id, message_id=msg_id)
+                except Exception:
+                    pass
+
+        # Show timeout notification briefly, then delete
+        timeout_msg = await safe_send(
             bot.send_message,
             chat_id,
             "⌛ <b>Час вийшов!</b> Питання пропущено — відповідь зараховано як неправильну.",
             parse_mode="HTML",
+            protect_content=True,
         )
 
         score = data.get("score", 0)
         current = data.get("current", 0)
         await state.update_data(score=score, current=current + 1)
         await asyncio.sleep(1.5)
+
+        # Delete timeout notification
+        if timeout_msg:
+            try:
+                await bot.delete_message(chat_id=chat_id, message_id=timeout_msg.message_id)
+            except Exception:
+                pass
 
         # Remove self from timers BEFORE calling send_question (which creates a new timer)
         _timers.pop(chat_id, None)
@@ -471,7 +475,7 @@ async def send_question(bot: Bot, chat_id: int, state: FSMContext, session: Asyn
     cancel_timer(chat_id)
 
     # Send question message
-    await safe_send(
+    q_msg = await safe_send(
         bot.send_message,
         chat_id,
         f"❓ <b>Питання {current + 1}/{len(q_ids)}</b>\n\n"
@@ -480,6 +484,7 @@ async def send_question(bot: Bot, chat_id: int, state: FSMContext, session: Asyn
         f"{options_text}",
         parse_mode="HTML",
         reply_markup=keyboard,
+        protect_content=True,
     )
 
     # Send timer message right after
@@ -488,7 +493,15 @@ async def send_question(bot: Bot, chat_id: int, state: FSMContext, session: Asyn
         chat_id,
         f"⏱ <b>Питання {current + 1}/{len(q_ids)}</b>\n{timer_bar(QUESTION_TIME)}",
         parse_mode="HTML",
+        protect_content=True,
     )
+
+    # Save message IDs in state so handle_answer can delete them
+    if q_msg and timer_msg:
+        await state.update_data(
+            q_msg_id=q_msg.message_id,
+            timer_msg_id=timer_msg.message_id,
+        )
 
     if timer_msg:
         task = asyncio.create_task(run_timer(
@@ -1707,6 +1720,9 @@ async def main():
             data = await state.get_data()
             score: int = data["score"]
             current: int = data["current"]
+            q_msg_id: int = data.get("q_msg_id", 0)
+            timer_msg_id_saved: int = data.get("timer_msg_id", 0)
+            chat_id = callback.message.chat.id
 
             is_correct = ans_idx == q.correct
             chosen_letter = chr(65 + ans_idx)
@@ -1722,13 +1738,35 @@ async def main():
                     f"✅ Правильна відповідь:\n{correct_letter}) {q.options[q.correct]}"
                 )
 
-            await safe_send(callback.message.edit_reply_markup, reply_markup=None)
-            await safe_send(callback.message.answer, feedback, parse_mode="HTML")
             await callback.answer()
 
+            # Delete question message and timer message
+            for msg_id in [q_msg_id, timer_msg_id_saved]:
+                if msg_id:
+                    try:
+                        await bot.delete_message(chat_id=chat_id, message_id=msg_id)
+                    except Exception:
+                        pass
+
+            # Show feedback briefly, then delete it too
+            feedback_msg = await safe_send(
+                bot.send_message,
+                chat_id,
+                feedback,
+                parse_mode="HTML",
+                protect_content=True,
+            )
             await state.update_data(score=score, current=current + 1)
             await asyncio.sleep(2.0)
-            await send_question(bot, callback.message.chat.id, state, session, session_factory)
+
+            # Delete feedback before showing next question
+            if feedback_msg:
+                try:
+                    await bot.delete_message(chat_id=chat_id, message_id=feedback_msg.message_id)
+                except Exception:
+                    pass
+
+            await send_question(bot, chat_id, state, session, session_factory)
 
     # -----------------------------------------------------------------------
     # Quiz quit — user presses "🚪 Завершити тест"
