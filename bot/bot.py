@@ -142,8 +142,8 @@ def teacher_keyboard() -> InlineKeyboardMarkup:
 def course_keyboard(level: str = "") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="👉 4 курс", callback_data=f"funnel:course4:{level}")],
-            [InlineKeyboardButton(text="👉 3 курс", callback_data=f"funnel:course3:{level}")],
+            [InlineKeyboardButton(text="👉 2026 рік", callback_data=f"funnel:course4:{level}")],
+            [InlineKeyboardButton(text="👉 2027 рік", callback_data=f"funnel:course3:{level}")],
         ]
     )
 
@@ -323,15 +323,7 @@ async def run_timer(
 
         q_msg_id_saved = data.get("q_msg_id", 0)
 
-        # Delete question message and timer message
-        for msg_id in [q_msg_id_saved, timer_msg_id]:
-            if msg_id:
-                try:
-                    await bot.delete_message(chat_id=chat_id, message_id=msg_id)
-                except Exception:
-                    pass
-
-        # Show timeout notification briefly, then delete
+        # Show timeout notification
         timeout_msg = await safe_send(
             bot.send_message,
             chat_id,
@@ -340,17 +332,25 @@ async def run_timer(
             protect_content=True,
         )
 
+        # Remove answer buttons from question (keep text visible)
+        if q_msg_id_saved:
+            try:
+                await bot.edit_message_reply_markup(
+                    chat_id=chat_id, message_id=q_msg_id_saved, reply_markup=None
+                )
+            except Exception:
+                pass
+
+        # Schedule deletion of question, timer and timeout msg after 24h
+        msgs_to_delete = [m for m in [q_msg_id_saved, timer_msg_id,
+                                       timeout_msg.message_id if timeout_msg else 0] if m]
+        if msgs_to_delete:
+            asyncio.create_task(_delete_messages_after(bot, chat_id, msgs_to_delete, delay=86400))
+
         score = data.get("score", 0)
         current = data.get("current", 0)
         await state.update_data(score=score, current=current + 1)
         await asyncio.sleep(1.5)
-
-        # Delete timeout notification
-        if timeout_msg:
-            try:
-                await bot.delete_message(chat_id=chat_id, message_id=timeout_msg.message_id)
-            except Exception:
-                pass
 
         # Remove self from timers BEFORE calling send_question (which creates a new timer)
         _timers.pop(chat_id, None)
@@ -363,6 +363,16 @@ async def run_timer(
     finally:
         # Only remove if still pointing to this task (don't remove a newer timer)
         pass
+
+async def _delete_messages_after(bot: Bot, chat_id: int, message_ids: list[int], delay: int = 86400):
+    """Delete messages after a delay (default 24h = 86400s)."""
+    await asyncio.sleep(delay)
+    for msg_id in message_ids:
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=msg_id)
+        except Exception:
+            pass  # already deleted or too old (Telegram allows deletion up to 48h)
+
 
 async def send_question(bot: Bot, chat_id: int, state: FSMContext, session: AsyncSession, session_factory=None):
     data = await state.get_data()
@@ -1389,8 +1399,8 @@ async def main():
             [InlineKeyboardButton(text="🟠 Задовільно (35–50)", callback_data="bcast_filter:score_satisf")],
             [InlineKeyboardButton(text="🟡 Середньо (51–80)", callback_data="bcast_filter:score_mid")],
             [InlineKeyboardButton(text="🟢 Добре (81–140)", callback_data="bcast_filter:score_high")],
-            [InlineKeyboardButton(text="🎓 3 курс", callback_data="bcast_filter:course3"),
-             InlineKeyboardButton(text="🎓 4 курс", callback_data="bcast_filter:course4")],
+            [InlineKeyboardButton(text="🎓 2027 рік", callback_data="bcast_filter:course3"),
+             InlineKeyboardButton(text="🎓 2026 рік", callback_data="bcast_filter:course4")],
             [InlineKeyboardButton(text="🆕 Ще не починали тест", callback_data="bcast_filter:no_test")],
             [InlineKeyboardButton(text="❌ Скасувати", callback_data="bcast_filter:cancel")],
         ])
@@ -1403,8 +1413,8 @@ async def main():
         "score_satisf": "🟠 Задовільно (35–50)",
         "score_mid": "🟡 Середньо (51–80)",
         "score_high": "🟢 Добре (81–140)",
-        "course3": "🎓 3 курс",
-        "course4": "🎓 4 курс",
+        "course3": "🎓 2027 рік",
+        "course4": "🎓 2026 рік",
         "no_test": "🆕 Ще не починали тест",
     }
 
@@ -1651,6 +1661,11 @@ async def main():
             f"Всього питань: <b>{len(q_ids)}</b>",
             parse_mode="HTML",
         )
+        await message.answer(
+            "⚠️ <b>ТВІЙ РЕЗУЛЬТАТ І ВІДПОВІДІ</b> будуть доступні <b>24 ГОДИНИ</b>, "
+            "після чого <b>АВТОМАТИЧНО ОЧИЩУЮТЬСЯ</b> — але ти завжди зможеш <b>ПРОЙТИ ТЕСТ ЩЕ РАЗ</b>.",
+            parse_mode="HTML",
+        )
 
         await state.set_state(UserState.quiz_in_progress)
         await state.set_data({
@@ -1740,15 +1755,13 @@ async def main():
 
             await callback.answer()
 
-            # Delete question message and timer message
-            for msg_id in [q_msg_id, timer_msg_id_saved]:
-                if msg_id:
-                    try:
-                        await bot.delete_message(chat_id=chat_id, message_id=msg_id)
-                    except Exception:
-                        pass
+            # Remove answer buttons from question (keep text visible)
+            try:
+                await callback.message.edit_reply_markup(reply_markup=None)
+            except Exception:
+                pass
 
-            # Show feedback briefly, then delete it too
+            # Show feedback
             feedback_msg = await safe_send(
                 bot.send_message,
                 chat_id,
@@ -1756,16 +1769,15 @@ async def main():
                 parse_mode="HTML",
                 protect_content=True,
             )
+
+            # Schedule deletion of question, timer and feedback after 24h
+            msgs_to_delete = [m for m in [q_msg_id, timer_msg_id_saved,
+                                           feedback_msg.message_id if feedback_msg else 0] if m]
+            if msgs_to_delete:
+                asyncio.create_task(_delete_messages_after(bot, chat_id, msgs_to_delete, delay=86400))
+
             await state.update_data(score=score, current=current + 1)
-            await asyncio.sleep(4.0)
-
-            # Delete feedback before showing next question
-            if feedback_msg:
-                try:
-                    await bot.delete_message(chat_id=chat_id, message_id=feedback_msg.message_id)
-                except Exception:
-                    pass
-
+            await asyncio.sleep(2.0)
             await send_question(bot, chat_id, state, session, session_factory)
 
     # -----------------------------------------------------------------------
