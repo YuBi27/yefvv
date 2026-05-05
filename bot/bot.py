@@ -606,10 +606,10 @@ async def main():
         elif req and req.status == "pending":
             await message.answer("⏳ Твоя заявка вже на розгляді. Очікуй підтвердження від адміністратора.")
         elif req and req.status == "rejected":
+            await state.set_state(UserState.waiting_screenshots)
             await message.answer(
                 "❌ На жаль, твою заявку відхилено.\n"
-                "Якщо вважаєш це помилкою — зв'яжись з викладачем.",
-                reply_markup=teacher_keyboard(),
+                "Переконайся, що виконав всі умови, і надішли скріншоти ще раз.",
             )
         else:
             await state.set_state(UserState.waiting_screenshots)
