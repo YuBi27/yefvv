@@ -618,7 +618,7 @@ async def main():
                 "Щоб отримати доступ до <b>АВТОРСЬКОЇ СИМУЛЯЦІЇ</b> тесту ЄФВВ з права, "
                 "якої <b>НЕМАЄ У ВІДКРИТОМУ ДОСТУПІ</b>, виконайте умови:\n\n"
                 "🤎 1. Підпишіться на Instagram <a href='https://www.instagram.com/yevhenia.frolova'>@yevhenia.frolova</a> — якщо ви ще не підписані.\n\n"
-                "🤎 2. Зробіть репост <b>ЦІЄЇ публікації</b> [вставимо посилання у понеділок] у свої stories з відміткою <a href='https://www.instagram.com/yevhenia.frolova'>@yevhenia.frolova</a>\n\n"
+                "🤎 2. Зробіть репост <a href='https://www.instagram.com/reel/DX584xGsvU8/?igsh=MXhoc29kZWJ0MzRuZQ=='><b>ЦІЄЇ публікації</b></a> у свої stories з відміткою <a href='https://www.instagram.com/yevhenia.frolova'>@yevhenia.frolova</a>\n\n"
                 "🤎 3. Сторіс має бути активна <b>24 години</b>.\n\n"
                 "🤎 4. Сторінка на цей час має бути <b>ВІДКРИТА</b>.\n\n"
                 "🔶 Після виконання умов:\n"
