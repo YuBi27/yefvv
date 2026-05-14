@@ -6,3 +6,4 @@ nginx_b.conf
 questions.csv
 test.pdf
 questions.sql
+__pycache__

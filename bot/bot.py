@@ -1153,7 +1153,8 @@ async def main():
             await callback.answer("⛔", show_alert=True)
             return
         fmt = callback.data.split(":")[1]
-        await callback.answer("⏳ Генерую файл...")
+        # Answer immediately to prevent Telegram timeout / bot freeze
+        await callback.answer("⏳ Генерую файл...", show_alert=False)
 
         all_results, profiles = await _fetch_all_results()
         if not all_results:
@@ -1194,10 +1195,12 @@ async def main():
         if callback.from_user.id not in ADMIN_IDS:
             await callback.answer("⛔", show_alert=True)
             return
+        # Answer immediately to prevent Telegram timeout / bot freeze
+        await callback.answer()
         page = int(callback.data.split(":")[1])
         text, total_pages, total = await _get_results_page(page)
         if total == 0:
-            await callback.answer("Немає даних.", show_alert=True)
+            await callback.message.answer("Немає даних.")
             return
         try:
             await callback.message.edit_text(
@@ -1206,8 +1209,12 @@ async def main():
                 reply_markup=results_page_keyboard(page, total_pages, total),
             )
         except Exception:
-            pass
-        await callback.answer()
+            # If edit fails (e.g. message too old or content unchanged), send a new message
+            await callback.message.answer(
+                text,
+                parse_mode="HTML",
+                reply_markup=results_page_keyboard(page, total_pages, total),
+            )
 
     @dp.callback_query(F.data == "results_noop")
     async def results_noop(callback: CallbackQuery):
@@ -1690,18 +1697,25 @@ async def main():
     @dp.callback_query(F.data.startswith("startquiz:"))
     async def handle_quiz_choice(callback: CallbackQuery, state: FSMContext):
         mode = callback.data.split(":")[1]
+        await callback.answer()
         if mode == "sections":
-            await callback.message.edit_reply_markup(reply_markup=None)
-            await callback.answer()
+            try:
+                await callback.message.edit_reply_markup(reply_markup=None)
+            except Exception:
+                pass
             await callback.message.answer("📚 Обери розділ:", reply_markup=sections_keyboard())
             return
         if mode == "back":
-            await callback.message.edit_reply_markup(reply_markup=None)
-            await callback.answer()
+            try:
+                await callback.message.edit_reply_markup(reply_markup=None)
+            except Exception:
+                pass
             await callback.message.answer("Обери формат тесту:", reply_markup=quiz_menu_keyboard())
             return
-        await callback.message.edit_reply_markup(reply_markup=None)
-        await callback.answer()
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
         count = None if mode == "all" else int(mode)
         await start_quiz(callback.message, state, count=count, user=callback.from_user)
 
@@ -1709,8 +1723,11 @@ async def main():
     async def handle_section_choice(callback: CallbackQuery, state: FSMContext):
         idx = int(callback.data.split(":")[1])
         section_name = SECTIONS_LIST[idx]
-        await callback.message.edit_reply_markup(reply_markup=None)
         await callback.answer()
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
         await start_quiz(
             callback.message, state,
             section=section_name,
@@ -1725,6 +1742,9 @@ async def main():
         _, q_id_str, ans_str = callback.data.split(":")
         q_id = int(q_id_str)
         ans_idx = int(ans_str)
+
+        # Answer immediately to prevent Telegram timeout / bot freeze
+        await callback.answer()
 
         # Cancel the running timer immediately
         cancel_timer(callback.message.chat.id)
@@ -1752,8 +1772,6 @@ async def main():
                     f"Твоя відповідь: {chosen_letter}) {q.options[ans_idx]}\n\n"
                     f"✅ Правильна відповідь:\n{correct_letter}) {q.options[q.correct]}"
                 )
-
-            await callback.answer()
 
             # Remove answer buttons from question (keep text visible)
             try:
@@ -1907,8 +1925,11 @@ async def main():
     async def handle_score_range(callback: CallbackQuery):
         parts = callback.data.split(":")
         level = parts[1]  # low / satisf / mid / high
-        await callback.message.edit_reply_markup(reply_markup=None)
         await callback.answer()
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
 
         if level == "low":
             text = (
@@ -1962,8 +1983,11 @@ async def main():
         parts = callback.data.split(":")
         course = parts[1]   # course3 or course4
         level = parts[2] if len(parts) > 2 else ""
-        await callback.message.edit_reply_markup(reply_markup=None)
         await callback.answer()
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
 
         if course == "course4":
             await callback.message.answer(
@@ -2046,8 +2070,11 @@ async def main():
     # -----------------------------------------------------------------------
     @dp.callback_query(F.data.startswith("funnel:interested") | F.data.startswith("funnel:want_more"))
     async def handle_interested(callback: CallbackQuery):
-        await callback.message.edit_reply_markup(reply_markup=None)
         await callback.answer()
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
         await callback.message.answer(
             "<b>ФОРМУЮ РАННІЙ СПИСОК (ЛИСТ ОЧІКУВАННЯ) НА 2027 РІК</b>\n\n"
             "Беру обмежену кількість студентів, адже працюю з кожним <b>ІНДИВІДУАЛЬНО</b> — "
@@ -2086,8 +2113,11 @@ async def main():
     # -----------------------------------------------------------------------
     @dp.callback_query(F.data == "restart_quiz")
     async def handle_restart(callback: CallbackQuery, state: FSMContext):
-        await callback.message.edit_reply_markup(reply_markup=None)
         await callback.answer()
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
         await callback.message.answer(
             "🔄 Обери формат тесту:",
             reply_markup=quiz_menu_keyboard(),
