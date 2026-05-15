@@ -1698,6 +1698,13 @@ async def main():
     async def handle_quiz_choice(callback: CallbackQuery, state: FSMContext):
         mode = callback.data.split(":")[1]
         await callback.answer()
+
+        # Block if already in quiz
+        current_state = await state.get_state()
+        if current_state in (UserState.quiz_in_progress, UserState.quiz_quit_comment):
+            await callback.message.answer("⚠️ Тест вже йде. Спочатку заверши або вийди з поточного тесту.")
+            return
+
         if mode == "sections":
             try:
                 await callback.message.edit_reply_markup(reply_markup=None)
@@ -1724,6 +1731,13 @@ async def main():
         idx = int(callback.data.split(":")[1])
         section_name = SECTIONS_LIST[idx]
         await callback.answer()
+
+        # Block if already in quiz
+        current_state = await state.get_state()
+        if current_state in (UserState.quiz_in_progress, UserState.quiz_quit_comment):
+            await callback.message.answer("⚠️ Тест вже йде. Спочатку заверши або вийди з поточного тесту.")
+            return
+
         try:
             await callback.message.edit_reply_markup(reply_markup=None)
         except Exception:
@@ -1835,6 +1849,31 @@ async def main():
         await callback.message.answer("▶️ Продовжуємо тест!")
         async with session_factory() as session:
             await send_question(bot, callback.message.chat.id, state, session, session_factory)
+
+    # Fallback: stale quiz buttons when state is gone (e.g. after bot restart)
+    @dp.callback_query(F.data.startswith("ans:"))
+    async def handle_answer_stale(callback: CallbackQuery):
+        await callback.answer("⌛ Цей тест вже завершено або час вийшов.", show_alert=True)
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+
+    @dp.callback_query(F.data == "quiz:quit")
+    async def quiz_quit_stale(callback: CallbackQuery):
+        await callback.answer("⌛ Тест вже не активний.", show_alert=True)
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+
+    @dp.callback_query(F.data == "quiz:resume")
+    async def quiz_resume_stale(callback: CallbackQuery):
+        await callback.answer("⌛ Тест вже не активний. Почни новий через /start.", show_alert=True)
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
 
     @dp.message(UserState.quiz_quit_comment)
     async def quiz_quit_save(message: Message, state: FSMContext):
@@ -2114,6 +2153,11 @@ async def main():
     @dp.callback_query(F.data == "restart_quiz")
     async def handle_restart(callback: CallbackQuery, state: FSMContext):
         await callback.answer()
+        # If in active quiz — cancel it first
+        current_state = await state.get_state()
+        if current_state in (UserState.quiz_in_progress, UserState.quiz_quit_comment):
+            cancel_timer(callback.message.chat.id)
+            await state.clear()
         try:
             await callback.message.edit_reply_markup(reply_markup=None)
         except Exception:
