@@ -27,6 +27,8 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from db import AccessRequest, Base, Question, UserResult
+from ratelimit import CallbackRateLimit, MessageRateLimit
+import cache
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -274,6 +276,8 @@ def timer_bar(seconds_left: int, total: int = QUESTION_TIME) -> str:
 
 # Active timers: chat_id -> asyncio.Task
 _timers: dict[int, asyncio.Task] = {}
+# Set in main() so module-level helpers (send_question, etc.) can reach Redis.
+_redis: "aioredis.Redis | None" = None
 
 
 def cancel_timer(chat_id: int):
@@ -436,9 +440,7 @@ async def send_question(bot: Bot, chat_id: int, state: FSMContext, session: Asyn
 
         # Notify all admins
         if ADMIN_IDS:
-            req = (await session.execute(
-                select(AccessRequest).where(AccessRequest.user_id == user_id)
-            )).scalar()
+            req = await cache.get_access_request(_redis, session, user_id)
             pib = req.pib if req and req.pib else "—"
             phone = req.phone if req and req.phone else "—"
             email = req.email if req and req.email else "—"
@@ -458,18 +460,21 @@ async def send_question(bot: Bot, chat_id: int, state: FSMContext, session: Asyn
                 + (f"📚 Розділ: {section_label}\n" if section_label else "")
                 + f"🏆 Результат: <b>{score}/{total}</b> ({pct}%)"
             )
-            for admin_id in ADMIN_IDS:
-                await safe_send(
+            await asyncio.gather(
+                *(safe_send(
                     bot.send_message,
                     admin_id, admin_text,
                     parse_mode="HTML",
                     reply_markup=write_to_user_keyboard(user_id),
-                )
+                ) for admin_id in ADMIN_IDS),
+                return_exceptions=True,
+            )
         return
 
     q_id = q_ids[current]
-    result = await session.execute(select(Question).where(Question.id == q_id))
-    q = result.scalar_one()
+    q = await cache.get_question(_redis, session, q_id)
+    if q is None:
+        return
 
     question_text = re.sub(r"\s+\d+\s*$", "", q.question).strip()
     options_text = "\n\n".join(
@@ -532,10 +537,19 @@ async def send_question(bot: Bot, chat_id: int, state: FSMContext, session: Asyn
 # ---------------------------------------------------------------------------
 
 async def main():
+    global _redis
     redis = aioredis.from_url(REDIS_URL)
+    _redis = redis
     storage = RedisStorage(redis)
 
-    engine = create_async_engine(DATABASE_URL, echo=False)
+    engine = create_async_engine(
+        DATABASE_URL,
+        echo=False,
+        pool_size=20,
+        max_overflow=20,
+        pool_pre_ping=True,
+        pool_recycle=1800,
+    )
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
@@ -556,8 +570,17 @@ async def main():
             await session.commit()
             logger.info("Seeded %d questions", len(qs))
 
+    # Warm Redis caches so the first quiz doesn't pay 140 DB roundtrips.
+    async with session_factory() as session:
+        await cache.warmup_questions(redis, session)
+        await cache.warmup_approved_set(redis, session)
+
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML", protect_content=True,))
     dp = Dispatcher(storage=storage)
+
+    # Rate limiting (admins bypass). Tune limits in bot/ratelimit.py.
+    dp.message.outer_middleware(MessageRateLimit(redis, ADMIN_IDS))
+    dp.callback_query.outer_middleware(CallbackRateLimit(redis, ADMIN_IDS))
 
     # -----------------------------------------------------------------------
     # /start
@@ -587,9 +610,7 @@ async def main():
             return
 
         async with session_factory() as session:
-            req = (await session.execute(
-                select(AccessRequest).where(AccessRequest.user_id == message.from_user.id)
-            )).scalar()
+            req = await cache.get_access_request(redis, session, message.from_user.id)
 
         if req and req.approved:
             # Check if profile is filled
@@ -728,6 +749,7 @@ async def main():
                 req.email = email
                 req.instagram = instagram
                 await session.commit()
+                await cache.invalidate_access_request(redis, message.from_user.id)
 
         await state.clear()
         await message.answer(
@@ -777,6 +799,8 @@ async def main():
                 existing.status = "pending"
                 existing.approved = False
                 await session.commit()
+                await cache.invalidate_access_request(redis, user.id)
+                await cache.remove_approved(redis, user.id)
             else:
                 session.add(AccessRequest(
                     user_id=user.id,
@@ -785,14 +809,16 @@ async def main():
                     status="pending",
                 ))
                 await session.commit()
+                await cache.invalidate_access_request(redis, user.id)
 
         await message.answer("✅ Скріншоти отримано! Адміністратор перевірить і надасть доступ найближчим часом.")
         await state.clear()
 
         if ADMIN_IDS:
-            for admin_id in ADMIN_IDS:
-                await bot.forward_message(admin_id, message.chat.id, message.message_id)
-                await bot.send_message(
+            async def _notify_admin(admin_id: int):
+                await safe_send(bot.forward_message, admin_id, message.chat.id, message.message_id)
+                await safe_send(
+                    bot.send_message,
                     admin_id,
                     f"📋 <b>Нова заявка на доступ</b>\n\n"
                     f"👤 {full_name}\n"
@@ -801,6 +827,11 @@ async def main():
                     parse_mode="HTML",
                     reply_markup=approve_keyboard(user.id),
                 )
+
+            await asyncio.gather(
+                *(_notify_admin(aid) for aid in ADMIN_IDS),
+                return_exceptions=True,
+            )
 
     @dp.message(UserState.waiting_screenshots)
     async def waiting_wrong_type(message: Message):
@@ -831,6 +862,8 @@ async def main():
                 req.status = "approved"
                 req.approved = True
                 await session.commit()
+                await cache.invalidate_access_request(redis, target_user_id)
+                await cache.add_approved(redis, target_user_id)
                 await callback.message.edit_reply_markup(reply_markup=None)
                 await callback.answer("✅ Доступ надано!")
                 await bot.send_message(
@@ -851,6 +884,8 @@ async def main():
                 req.status = "rejected"
                 req.approved = False
                 await session.commit()
+                await cache.invalidate_access_request(redis, target_user_id)
+                await cache.remove_approved(redis, target_user_id)
                 await callback.message.edit_reply_markup(reply_markup=None)
                 await callback.answer("❌ Заявку відхилено.")
                 await bot.send_message(
@@ -1376,6 +1411,7 @@ async def main():
                 q.correct = ord(letter) - ord("A")
 
             await session.commit()
+            await cache.invalidate_question(redis, q_id)
 
             # Show updated question
             opts_text = "\n".join(f"  <b>{chr(65+i)})</b> {o}" for i, o in enumerate(q.options))
@@ -1430,17 +1466,13 @@ async def main():
         cutoff = datetime.utcnow() - timedelta(days=7)
         async with session_factory() as session:
             if filter_key == "all":
-                return list((await session.execute(
-                    select(AccessRequest.user_id).where(AccessRequest.approved == True)
-                )).scalars().all())
+                return await cache.get_approved_ids(redis, session)
 
             elif filter_key == "no_test":
                 tested = set((await session.execute(
                     select(UserResult.user_id).where(UserResult.created_at >= cutoff).distinct()
                 )).scalars().all())
-                all_approved = (await session.execute(
-                    select(AccessRequest.user_id).where(AccessRequest.approved == True)
-                )).scalars().all()
+                all_approved = await cache.get_approved_ids(redis, session)
                 return [uid for uid in all_approved if uid not in tested]
 
             elif filter_key == "completed":
@@ -1593,9 +1625,7 @@ async def main():
         if message.from_user.id in ADMIN_IDS:
             return True
         async with session_factory() as session:
-            req = (await session.execute(
-                select(AccessRequest).where(AccessRequest.user_id == message.from_user.id)
-            )).scalar()
+            req = await cache.get_access_request(redis, session, message.from_user.id)
         if req and req.approved:
             return True
         await message.answer("🔒 Спочатку потрібно отримати доступ. Напиши /start і надішли скріншоти.")
@@ -1632,9 +1662,7 @@ async def main():
         is_admin = actual_user.id in ADMIN_IDS
 
         async with session_factory() as session:
-            req = (await session.execute(
-                select(AccessRequest).where(AccessRequest.user_id == actual_user.id)
-            )).scalar()
+            req = await cache.get_access_request(redis, session, actual_user.id)
         has_access = (req and req.approved) or is_admin
         if not has_access:
             await message.answer("🔒 Спочатку потрібно отримати доступ. Напиши /start і надішли скріншоти.")
@@ -1760,11 +1788,17 @@ async def main():
         # Answer immediately to prevent Telegram timeout / bot freeze
         await callback.answer()
 
+        # Reject double-clicks: only one answer per (user, question) within 5s.
+        if not await cache.acquire_answer_lock(redis, callback.from_user.id, q_id):
+            return
+
         # Cancel the running timer immediately
         cancel_timer(callback.message.chat.id)
 
         async with session_factory() as session:
-            q = (await session.execute(select(Question).where(Question.id == q_id))).scalar_one()
+            q = await cache.get_question(redis, session, q_id)
+            if q is None:
+                return
 
             data = await state.get_data()
             score: int = data["score"]
@@ -1941,21 +1975,23 @@ async def main():
 
         # Notify admins
         if ADMIN_IDS:
-            for admin_id in ADMIN_IDS:
-                try:
-                    await bot.send_message(
-                        admin_id,
-                        f"⚠️ <b>Користувач завершив тест достроково</b>\n\n"
-                        f"👤 @{username} (<code>{user_id}</code>)\n"
-                        f"📊 Пройдено: {current}/{total} питань\n"
-                        f"✅ Правильних: {score}\n"
-                        + (f"📚 Розділ: {section_label}\n" if section_label else "")
-                        + f"\n💬 Причина: <i>{comment}</i>",
-                        parse_mode="HTML",
-                        reply_markup=write_to_user_keyboard(user_id),
-                    )
-                except Exception:
-                    pass
+            quit_text = (
+                f"⚠️ <b>Користувач завершив тест достроково</b>\n\n"
+                f"👤 @{username} (<code>{user_id}</code>)\n"
+                f"📊 Пройдено: {current}/{total} питань\n"
+                f"✅ Правильних: {score}\n"
+                + (f"📚 Розділ: {section_label}\n" if section_label else "")
+                + f"\n💬 Причина: <i>{comment}</i>"
+            )
+            await asyncio.gather(
+                *(safe_send(
+                    bot.send_message,
+                    admin_id, quit_text,
+                    parse_mode="HTML",
+                    reply_markup=write_to_user_keyboard(user_id),
+                ) for admin_id in ADMIN_IDS),
+                return_exceptions=True,
+            )
 
     # -----------------------------------------------------------------------
     # Post-test funnel — score range selection
